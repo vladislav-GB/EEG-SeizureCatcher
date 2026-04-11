@@ -7,64 +7,113 @@ preprocessing.py - Подготовка данных для EEGNeX
 
 АЛГОРИТМ:
     1. Загрузить выборки (train/val/test) из CSV файлов, созданных R-скриптом
-
     2. Для каждого пациента:
-       a) Загрузить EDF файл
-       b) Извлечь 19 каналов ЭЭГ
-       c) Применить фильтрацию и нормализацию
-       d) Загрузить экспертные оценки для нужных эпох
-       e) Нарезать окна (4 сек, шаг 1 сек)
-       f) Рассчитать soft labels, hard labels, confidence
-       g) Рассчитать веса: 
-       pattern_weight × (0.3 + 0.7 * agreement) × (0.5 + 0.5 * confidence)
-
+       a) Загрузить EDF файл (с безопасным чтением)
+       b) Извлечь 19 каналов ЭЭГ по системе 10-20
+       c) Применить фильтрацию (0.5-30 Гц + режектор 50 Гц)
+       d) Ресемплинг до 256 Гц
+       e) Z-нормализация
+       f) Загрузить экспертные оценки (A, B, C)
+       g) Нарезать окна (5 сек, шаг 1 сек, перекрытие 4 сек)
+       h) Рассчитать soft target = (A+B+C)/3
+       i) Рассчитать weight = 0.33 (1 эксперт), 0.67 (2 эксперта), 1.0 (3 эксперта)
+       j) Усреднить target и weight по окну с весами позиций [0.1,0.2,0.4,0.2,0.1]
     3. Сохранить train/val/test .pkl файлы
 
 ВХОДНЫЕ ФАЙЛЫ:
-    - EDF: eeg{id}.edf
-    - CSV: R_results/helsinki_EDFchek/train_sample.csv
-    - CSV: R_results/helsinki_EDFchek/val_sample.csv
-    - CSV: R_results/helsinki_EDFchek/test_sample.csv
+    - EDF: /media/avengus/Локальный диск/Dev/EEG/helsinki/eeg{id}.edf
+    - CSV: /media/avengus/Локальный диск/Dev/EEG/helsinki/annotations_2017_A.csv
+    - CSV: /media/avengus/Локальный диск/Dev/EEG/helsinki/annotations_2017_B.csv
+    - CSV: /media/avengus/Локальный диск/Dev/EEG/helsinki/annotations_2017_C.csv
 
 ВЫХОДНЫЕ ФАЙЛЫ:
     - helsinki_train.pkl
     - helsinki_val.pkl
     - helsinki_test.pkl
+
+КАЖДЫЙ .PKL ФАЙЛ СОДЕРЖИТ:
+    - X: [N, 19, 1280] — сигналы (N окон, 19 каналов, 5 сек × 256 Гц)
+    - targets: [N] — soft labels (0, 0.33, 0.67, 1.0)
+    - weights: [N] — веса окон (0.33, 0.67, 1.0)
 """
 
+import sys
 import os
+import gc
 import pickle
+import warnings
+from datetime import datetime
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
-from pathlib import Path
+import mne
+import psutil
+from scipy.signal import butter, filtfilt, resample
 from tqdm import tqdm
 
-import mne
-from scipy.signal import butter, filtfilt
-from config import Config
+sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+from Config.config import Config
+
+warnings.filterwarnings('ignore')
 
 # ============================================================================
-# 1. ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+# ЛОГИРОВАНИЕ
+# ============================================================================
+
+log_filename = f"preprocessing_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+log_file = open(log_filename, 'w', encoding='utf-8')
+
+def log(msg):
+    timestamp = datetime.now().strftime('%H:%M:%S')
+    line = f"[{timestamp}] {msg}"
+    print(line)
+    log_file.write(line + '\n')
+    log_file.flush()
+
+def log_memory(stage=""):
+    process = psutil.Process()
+    mem_mb = process.memory_info().rss / 1024 / 1024
+    log(f"💾 {stage}: {mem_mb:.0f} MB")
+
+# ============================================================================
+# БЕЗОПАСНОЕ ЧТЕНИЕ EDF
+# ============================================================================
+
+def read_edf_safe(edf_path):
+    """
+    Безопасное чтение EDF файла.
+    При ошибке возвращает None (пациент пропускается).
+    """
+    try:
+        raw = mne.io.read_raw_edf(edf_path, preload=True, verbose=False)
+        return raw
+    except Exception:
+        return None
+
+# ============================================================================
+# ФИЛЬТРАЦИЯ
 # ============================================================================
 
 def create_filters(sr):
     """
-    Создает коэффициенты фильтров Баттерворта 4-го порядка ("шумодав" для мозговых волн).
+    Создаёт коэффициенты фильтров Баттерворта 4-го порядка.
     
     Возвращает:
         band_filter: полосовой фильтр 0.5-30 Гц
-        notch_filter: режекторный фильтр 50 Гц
+        notch_filter: режекторный фильтр 50 Гц (ширина 2 Гц)
     """
     nyquist = 0.5 * sr
     
-    # Полосовой фильтр
+    # Полосовой фильтр 0.5-30 Гц
     low = Config.LOWCUT / nyquist
     high = Config.HIGHCUT / nyquist
     b_band, a_band = butter(4, [low, high], btype='band')
     
-    # Режекторный фильтр (50 Гц)
-    notch = Config.NOTCH / nyquist
-    b_notch, a_notch = butter(4, [notch-0.01, notch+0.01], btype='bandstop')
+    # Режекторный фильтр 50 Гц (ширина ±1 Гц)
+    notch_low = (Config.NOTCH - 1) / nyquist
+    notch_high = (Config.NOTCH + 1) / nyquist
+    b_notch, a_notch = butter(4, [notch_low, notch_high], btype='bandstop')
     
     return (b_band, a_band), (b_notch, a_notch)
 
@@ -73,562 +122,331 @@ def process_signal(signal, orig_sr, target_sr, filters):
     """
     Полная обработка одноканального сигнала.
     
-    Шаги:
-        1. Ресемплинг до целевой частоты (если нужно)
-        2. Полосовая фильтрация
-        3. Режекторная фильтрация (50 Гц)
-        4. Z-нормализация (среднее=0, дисперсия=1)
+    Порядок операций:
+        1. Полосовая фильтрация 0.5-30 Гц
+        2. Режекторный фильтр 50 Гц
+        3. Z-нормализация
     """
-    # Ресемплинг
-    if orig_sr != target_sr:
-        duration = len(signal) / orig_sr
-        new_len = int(duration * target_sr)
-        signal = np.interp(
-            np.linspace(0, len(signal)-1, new_len),
-            np.arange(len(signal)),
-            signal
-        )
-    
-    # Фильтрация
     (b_band, a_band), (b_notch, a_notch) = filters
+    
+    # Шаг 1-2: фильтрация
     signal = filtfilt(b_band, a_band, signal)
     signal = filtfilt(b_notch, a_notch, signal)
     
-    # Нормализация
+    # Шаг 3: Z-нормализация
     signal = (signal - np.mean(signal)) / (np.std(signal) + 1e-8)
     
     return signal
 
+# ============================================================================
+# ВЕСА ДЛЯ СЕКУНДЫ
+# ============================================================================
 
-def compute_sample_weight(A_win, B_win, C_win, pattern_weight):
+def get_second_target_and_weight(a, b, c):
     """
-    ВЫЧИСЛЕНИЕ ВЕСА ОКНА НА ОСНОВЕ ТРЕХ ФАКТОРОВ
+    Вычисляет target и weight для одной секунды.
     
-    ============================================================================
-    НАЗНАЧЕНИЕ
-    ============================================================================
-    Функция рассчитывает итоговый вес для каждого временного окна ЭЭГ сигнала.
-    Вес определяет, насколько сильно это окно повлияет на обучение модели.
-    
-    Чем выше вес, тем больше модель "учится" на этом окне.
-    Чем ниже вес, тем меньше влияние окна (спорные или ненадежные данные).
-    
-    
-    ============================================================================
-    ВХОДНЫЕ ПАРАМЕТРЫ
-    ============================================================================
-    
-    A_win : np.ndarray
-        Оценки эксперта A для всех временных точек в окне (массив 0/1)
-        Длина массива = WINDOW_SIZE (1024 точки при 256 Гц и 4 сек)
-    
-    B_win : np.ndarray
-        Оценки эксперта B для всех временных точек в окне
-    
-    C_win : np.ndarray
-        Оценки эксперта C для всех временных точек в окне
-    
-    pattern_weight : float
-        Базовый вес паттерна из R-анализа (0.2 ... 1.0)
-        Определяется по середине окна:
-        - '000' (фон) → 0.2
-        - '001', '010', '100' (один эксперт) → 0.3-0.5
-        - '011', '101', '110' (два эксперта) → 0.85-0.9
-        - '111' (полное согласие) → 1.0
-    
-    
-    ============================================================================
-    ВЫХОДНЫЕ ПАРАМЕТРЫ
-    ============================================================================
-    
-    sample_weight : float
-        Итоговый вес окна (0.0 ... 1.0)
-        Используется в функции потерь для взвешивания вклада окна
-    
-    agreement : float
-        Локальное согласие экспертов (0.0 ... 1.0)
-        Показывает, насколько схожи средние оценки экспертов в окне
-    
-    confidence : float
-        Уверенность экспертов (0.0 ... 1.0)
-        Показывает, насколько эксперты единодушны в каждой временной точке
-    
-    
-    ============================================================================
-    АЛГОРИТМ РАСЧЕТА
-    ============================================================================
-    
-    ШАГ 1: РАСЧЕТ ЛОКАЛЬНОГО СОГЛАСИЯ (AGREEMENT)
-    -----------------------------------------------
-    Идея: оценить, насколько схожи эксперты в среднем по всему окну.
-    
-    mean_A = среднее значение оценок эксперта A в окне
-    mean_B = среднее значение оценок эксперта B в окне
-    mean_C = среднее значение оценок эксперта C в окне
-    
-    Пример:
-        Если mean_A = 0.1, mean_B = 0.1, mean_C = 0.1 → эксперты согласны
-        Если mean_A = 0.0, mean_B = 0.5, mean_C = 1.0 → эксперты не согласны
-    
-    std_means = стандартное отклонение [mean_A, mean_B, mean_C]
-    
-    agreement = 1 - std_means
-    
-    Логика:
-        - std_means = 0   (полное согласие) → agreement = 1.0
-        - std_means = 0.5 (среднее расхождение) → agreement = 0.5
-        - std_means = 1.0 (полное расхождение) → agreement = 0.0
-    
-    Затем agreement ограничивается диапазоном [0, 1]
-    
-    
-    ШАГ 2: РАСЧЕТ УВЕРЕННОСТИ (CONFIDENCE)
-    ---------------------------------------
-    Идея: оценить, насколько эксперты согласны в КАЖДОЙ временной точке.
-    
-    expert_matrix = [A_win, B_win, C_win]  # матрица 3 x WINDOW_SIZE
-    disagreement = среднее по времени от std(по экспертам)
-    
-    Пример для одной временной точки:
-        Оценки [0,0,0] → std = 0.00 → disagreement малый
-        Оценки [0,0,1] → std = 0.47 → disagreement средний
-        Оценки [0,1,0] → std = 0.47 → disagreement средний
-        Оценки [0,1,1] → std = 0.47 → disagreement средний
-        Оценки [1,0,0] → std = 0.47 → disagreement средний
-        Оценки [1,1,0] → std = 0.47 → disagreement средний
-        Оценки [1,0,1] → std = 0.47 → disagreement средний
-        Оценки [1,1,1] → std = 0.00 → disagreement малый
-    
-    Максимальное возможное std для бинарных значений = 0.5
-    (когда один эксперт говорит 1, другой 0, третий 0 или 1)
-    
-    confidence = 1 - (disagreement / 0.5)
-    
-    Логика:
-        - disagreement = 0.0 (полное согласие) → confidence = 1.0
-        - disagreement = 0.25 (среднее) → confidence = 0.5
-        - disagreement = 0.5 (максимальное) → confidence = 0.0
-    
-    Затем confidence ограничивается диапазоном [0, 1]
-    
-    
-    ШАГ 3: РАСЧЕТ ФИНАЛЬНОГО ВЕСА
-    -------------------------------
-    Итоговый вес = pattern_weight × factor_agreement × factor_confidence
-    
-    factor_agreement = 0.3 + 0.7 × agreement
-    factor_confidence = 0.5 + 0.5 × confidence
-    
-    Зачем нужны коэффициенты 0.3 и 0.5? (сдвиги)
-    
-    БЕЗ сдвига (agreement напрямую):
-        Если agreement = 0 → вес обнулится → модель не учится на спорных окнах
-        Но даже спорные окна содержат полезную информацию!
-    
-    СО сдвигом 0.3:
-        agreement = 0 → factor = 0.3 (30% веса сохраняется)
-        agreement = 1 → factor = 1.0 (100% веса)
-        agreement = 0.5 → factor = 0.65 (65% веса)
-    
-    СО сдвигом 0.5 (для confidence):
-        confidence = 0 → factor = 0.5 (50% веса сохраняется)
-        confidence = 1 → factor = 1.0 (100% веса)
-        confidence = 0.5 → factor = 0.75 (75% веса)
-    
-    Это гарантирует, что модель всегда получает сигнал, даже из спорных данных,
-    но с соответствующим пониженным весом.
-    
-    
-    ============================================================================
-    ПРИМЕРЫ РАСЧЕТА
-    ============================================================================
-    
-    ПРИМЕР 1: Идеальное окно (четкий приступ)
-    -----------------------------------------
-    A_win = [1,1,1,1,1,1,1,1,1,1]  (все 1)
-    B_win = [1,1,1,1,1,1,1,1,1,1]  (все 1)
-    C_win = [1,1,1,1,1,1,1,1,1,1]  (все 1)
-    pattern_weight = 1.0  (паттерн 111)
-    
-    Шаг 1: mean_A = 1.0, mean_B = 1.0, mean_C = 1.0
-           std_means = 0.0 → agreement = 1.0
-    
-    Шаг 2: disagreement = 0.0 (все точки одинаковы)
-           confidence = 1 - (0.0/0.5) = 1.0
-    
-    Шаг 3: factor_agreement = 0.3 + 0.7×1.0 = 1.0
-           factor_confidence = 0.5 + 0.5×1.0 = 1.0
-           sample_weight = 1.0 × 1.0 × 1.0 = 1.0
-    
-    Интерпретация: модель учится в полную силу
-    
-    
-    ПРИМЕР 2: Спорное окно (только B видит приступ)
-    -----------------------------------------------
-    A_win = [0,0,0,0,0,0,0,0,0,0]  (все 0)
-    B_win = [1,1,1,1,1,1,1,1,1,1]  (все 1)
-    C_win = [0,0,0,0,0,0,0,0,0,0]  (все 0)
-    pattern_weight = 0.5  (паттерн 010)
-    
-    Шаг 1: mean_A = 0.0, mean_B = 1.0, mean_C = 0.0
-           std_means = 0.47 → agreement = 0.53
-    
-    Шаг 2: disagreement = 0.47 (разные оценки в каждой точке)
-           confidence = 1 - (0.47/0.5) = 0.06
-    
-    Шаг 3: factor_agreement = 0.3 + 0.7×0.53 = 0.67
-           factor_confidence = 0.5 + 0.5×0.06 = 0.53
-           sample_weight = 0.5 × 0.67 × 0.53 = 0.18
-    
-    Интерпретация: модель учится с весом ~18% от полного
-    
-    
-    ПРИМЕР 3: Неуверенные эксперты (плавающие оценки)
-    -----------------------------------------------
-    A_win = [0,0,1,1,0,0,1,1,0,0]  (50% единиц)
-    B_win = [0,1,0,1,0,1,0,1,0,1]  (50% единиц)
-    C_win = [0,0,0,1,1,1,0,0,0,1]  (40% единиц)
-    pattern_weight = 0.85  (паттерн 011 или 101 или 110)
-    
-    Шаг 1: mean_A = 0.5, mean_B = 0.5, mean_C = 0.4
-           std_means = 0.05 → agreement = 0.95
-    
-    Шаг 2: disagreement = 0.32 (средний разброс)
-           confidence = 1 - (0.32/0.5) = 0.36
-    
-    Шаг 3: factor_agreement = 0.3 + 0.7×0.95 = 0.97
-           factor_confidence = 0.5 + 0.5×0.36 = 0.68
-           sample_weight = 0.85 × 0.97 × 0.68 = 0.56
-    
-    Интерпретация: модель учится с весом ~56% от полного
-    
-    
-    ============================================================================
-    ЗНАЧЕНИЯ ВЕСОВ И ИХ ИНТЕРПРЕТАЦИЯ
-    ============================================================================
-    
-    Вес > 0.8  → Высокая достоверность (полное согласие, уверенные эксперты)
-    Вес 0.5-0.8 → Средняя достоверность (частичное согласие)
-    Вес 0.2-0.5 → Низкая достоверность (спорные случаи, один эксперт)
-    Вес < 0.2  → Очень низкая достоверность (фон или сильные разногласия)
-    
-    
-    ============================================================================
-    ПОЧЕМУ ЭТА ФОРМУЛА ЛУЧШЕ
-    ============================================================================
-    
-    1. УЧЕТ ДВУХ УРОВНЕЙ НЕОПРЕДЕЛЕННОСТИ:
-       - agreement: глобальное согласие по всему окну
-       - confidence: локальная уверенность в каждой точке
-    
-    2. НИКОГДА НЕ ОБНУЛЯЕТ ВЕСА:
-       - Даже при полном разногласии вес > 0
-       - Модель всегда получает сигнал для обучения
-    
-    3. БАЗИРУЕТСЯ НА РЕАЛЬНЫХ ДАННЫХ:
-       - pattern_weight из статистики R-анализа
-       - Не использует kappa пациента (была слишком грубой)
-    
-    4. ЛИНЕЙНОСТЬ И ПРОЗРАЧНОСТЬ:
-       - Легко интерпретировать
-       - Легко модифицировать при необходимости
-    
-    
-    ============================================================================
-    ИСПОЛЬЗОВАНИЕ В ОБУЧЕНИИ
-    ============================================================================
-    
-    В функции потерь weighted_bce:
-        loss = (BCE(pred, target) * sample_weight).sum() / sample_weight.sum()
-    
-    Это означает:
-        - Окна с высоким весом сильнее влияют на градиент
-        - Окна с низким весом почти не влияют на обучение
-        - Модель фокусируется на надежных данных, но не игнорирует спорные
-    
-    ============================================================================
+    target = (A+B+C)/3 — вероятность приступа
+    weight = 1.0 (3 эксперта), 0.67 (2 эксперта), 0.33 (1 эксперт)
     """
+    n_positive = a + b + c
+    target = n_positive / 3.0
+    
+    # Используем веса из Config
+    if n_positive == 0:
+        weight = Config.WEIGHT_BACKGROUND  
+    elif n_positive == 3:
+        weight = Config.WEIGHT_ALL_AGREE   
+    elif n_positive == 2:
+        weight = Config.WEIGHT_TWO_AGREE   
+    else:  # n_positive == 1
+        weight = Config.WEIGHT_ONE_AGREE   
+    
+    return target, weight
 
-     # 1. Локальное согласие (
-    mean_A = np.mean(A_win)
-    mean_B = np.mean(B_win)
-    mean_C = np.mean(C_win)
-    agreement = 1 - np.std([mean_A, mean_B, mean_C])
-    agreement = np.clip(agreement, 0, 1)
+# ============================================================================
+# ГЕНЕРАЦИЯ ОКОН ДЛЯ ПАЦИЕНТА
+# ============================================================================
 
-    # 2. Уверенность экспертов (на основе поточечного std)
-    expert_matrix = np.stack([A_win, B_win, C_win], axis=0)
-    disagreement = np.std(expert_matrix, axis=0).mean()
-    confidence = 1 - (disagreement / 0.5)
-    confidence = np.clip(confidence, 0, 1)
+def generate_windows_for_patient(signals, annotations_A, annotations_B, annotations_C, sfreq):
+    """
+    Генерирует окна для одного пациента.
+    
+    Параметры:
+        signals: [channels, time] — сигнал ЭЭГ
+        annotations_A/B/C: массивы оценок экспертов (0/1) по секундам
+        sfreq: частота дискретизации
+    
+    Возвращает:
+        windows: [n_windows, channels, time]
+        targets: [n_windows] — soft labels
+        weights: [n_windows] — веса окон
+    """
+    window_sec = Config.WINDOW_SEC
+    pos_weights = Config.POS_WEIGHTS
+    
+    n_seconds = len(annotations_A)
+    n_samples = signals.shape[1]
+    n_sec_actual = min(n_seconds, n_samples // sfreq)
+    
+    # Посекундные target и weight
+    sec_targets = []
+    sec_weights = []
+    for i in range(n_sec_actual):
+        t, w = get_second_target_and_weight(
+            annotations_A[i], annotations_B[i], annotations_C[i]
+        )
+        sec_targets.append(t)
+        sec_weights.append(w)
+    
+    windows, targets, weights = [], [], []
+    
+    for start_sec in range(0, n_sec_actual - window_sec + 1, Config.STRIDE_SEC):
+        end_sec = start_sec + window_sec
+        
+        start_sample = start_sec * sfreq
+        end_sample = end_sec * sfreq
+        
+        window_data = signals[:, start_sample:end_sample]
+        window_targets = sec_targets[start_sec:end_sec]
+        window_weights = sec_weights[start_sec:end_sec]
+        
+        # Взвешенное среднее (центр важнее краёв)
+        weighted_target = np.average(window_targets, weights=pos_weights)
+        weighted_weight = np.average(window_weights, weights=pos_weights)
+        
+        windows.append(window_data)
+        targets.append(weighted_target)
+        weights.append(weighted_weight)
+    
+    if len(windows) == 0:
+        return np.array([]), np.array([]), np.array([])
+    
+    return np.array(windows), np.array(targets), np.array(weights)
 
-    # 3. Финальный вес 
-    sample_weight = (
-        pattern_weight *
-        (0.3 + 0.7 * agreement) *
-        (0.5 + 0.5 * confidence)
+# ============================================================================
+# ОБРАБОТКА ПАЦИЕНТА
+# ============================================================================
+
+def process_patient(patient_id, patient_data, filters):
+    """
+    Обрабатывает одного пациента.
+    
+    Аргументы:
+        patient_id: номер пациента (1-79)
+        patient_data: DataFrame с колонками expert_A, expert_B, expert_C
+        filters: коэффициенты фильтров
+    
+    Возвращает:
+        dict с ключами X, targets, weights
+        или None, если пациент пропущен
+    """
+    edf_file = Path(Config.DATA_PATH) / f"eeg{patient_id}.edf"
+    if not edf_file.exists():
+        log(f"⚠️ Пациент {patient_id}: EDF не найден")
+        return None
+    
+    raw = read_edf_safe(edf_file)
+    if raw is None:
+        log(f"⚠️ Пациент {patient_id}: не удалось прочитать EDF")
+        return None
+    
+    orig_sfreq = int(raw.info['sfreq'])
+    
+    # Ресемплинг до целевой частоты через MNE
+    if orig_sfreq != Config.TARGET_SR:
+        raw = raw.resample(Config.TARGET_SR, npad='auto')
+        log(f"   Пациент {patient_id}: ресемплинг {orig_sfreq} → {Config.TARGET_SR} Гц")
+    
+    sfreq = Config.TARGET_SR
+    
+    # Извлечение каналов
+    ch_names = [ch.upper() for ch in raw.ch_names]
+    signals = []
+    
+    for target_ch in Config.CHANNELS:
+        idx = None
+        for i, name in enumerate(ch_names):
+            clean_name = name.replace('-REF', '').replace('-Ref', '').replace('EEG ', '')
+            if target_ch.upper() in clean_name.upper():
+                idx = i
+                break
+        if idx is None:
+            log(f"❌ Пациент {patient_id}: канал {target_ch} не найден")
+            return None
+        
+        data, _ = raw[idx, :]
+        sig = data[0].astype(np.float64)
+        sig = process_signal(sig, sfreq, Config.TARGET_SR, filters)
+        signals.append(sig)
+    
+    signals = np.stack(signals, axis=0)
+    
+    # Обрезаем аннотации до длины сигнала
+    n_samples = signals.shape[1]
+    n_sec = n_samples // sfreq
+    patient_data = patient_data.iloc[:n_sec]
+    
+    if n_sec < Config.WINDOW_SEC:
+        log(f"⚠️ Пациент {patient_id}: сигнал слишком короткий ({n_sec} сек < {Config.WINDOW_SEC} сек)")
+        return None
+    
+    # Генерация окон
+    windows, targets, weights = generate_windows_for_patient(
+        signals,
+        patient_data['expert_A'].values,
+        patient_data['expert_B'].values,
+        patient_data['expert_C'].values,
+        sfreq
     )
     
-    return sample_weight, agreement, confidence
-
+    if len(windows) == 0:
+        log(f"⚠️ Пациент {patient_id}: не сгенерировано окон")
+        return None
+    
+    # Очистка памяти
+    del raw, signals
+    gc.collect()
+    
+    return {
+        'X': windows.astype(np.float32),
+        'targets': targets.astype(np.float32),
+        'weights': weights.astype(np.float32)
+    }
 
 # ============================================================================
-# 2. ОСНОВНОЙ КЛАСС ПРЕПРОЦЕССОРА
+# ОСНОВНАЯ ФУНКЦИЯ
 # ============================================================================
 
-class EEGPreprocessor:
+def process_split(patients, split_name):
     """
-    Главный класс, управляющий процессом предобработки.
+    Обрабатывает выборку (train/val/test).
+    
+    Аргументы:
+        patients: список номеров пациентов
+        split_name: 'train', 'val' или 'test'
     """
-    
-    def __init__(self):
-        """Инициализация: создание фильтров, загрузка путей"""
-        self.filters = create_filters(Config.TARGET_SR)
-        
-        # Создаем выходные папки
-        Path(Config.OUTPUT_PATH).mkdir(parents=True, exist_ok=True)
-        Path(Config.VISUALIZATION_PATH).mkdir(parents=True, exist_ok=True)
-        Path(Config.MODEL_PATH).mkdir(parents=True, exist_ok=True)
+    filters = create_filters(Config.TARGET_SR)
 
-        # Фиксируем seed для воспроизводимости
-        Config.set_seed()
-        
-        print(f"\n{'='*60}")
-        print("ПРЕПРОЦЕССОР EEGNeX")
-        print(f"{'='*60}")
-        print(f"SEED: {Config.SEED}")
-        print(f"Целевая частота: {Config.TARGET_SR} Гц")
-        print(f"Размер окна: {Config.WINDOW_SIZE} точек ({Config.WINDOW_SEC} сек)")
-        print(f"Окон на пациента: {Config.N_WINDOWS}")
-        print(f"Каналов: {Config.N_CHANNELS}")
-        print(f"{'='*60}\n")
+    # Создаём выходную директорию
+    Path(Config.OUTPUT_PATH).mkdir(parents=True, exist_ok=True)
     
-    def load_sample(self, sample_name):
-        """
-        Загружает выборку (train/val/test) из CSV файла.
-        
-        CSV файл содержит колонки:
-            - record: номер эпохи
-            - signal: номер пациента
-            - pattern: паттерн с префиксом 'P' (например, 'P010')
-            - expert_A, expert_B, expert_C: оценки экспертов
-            - fleiss_kappa: каппа для этого сигнала
-            - pattern_weight: вес паттерна из R-анализа
-        """
-        file_path = Path(Config.R_DATA_PATH) / f"{sample_name}_sample.csv"
-        df = pd.read_csv(file_path, sep=';', encoding='windows-1251')
-        
-        # Убираем префикс 'P' из паттернов (P010 → 010)
-        df['pattern'] = df['pattern'].str[1:]
-        
-        print(f"Загружен {sample_name}: {len(df)} строк, {df['signal'].nunique()} пациентов")
-        return df
+    # Загрузка CSV с аннотациями
+    A = pd.read_csv(Path(Config.DATA_PATH) / "annotations_2017_A.csv", header=None)
+    B = pd.read_csv(Path(Config.DATA_PATH) / "annotations_2017_B.csv", header=None)
+    C = pd.read_csv(Path(Config.DATA_PATH) / "annotations_2017_C.csv", header=None)
     
-    def process_patient(self, patient_id, patient_data):
-        """
-        Обрабатывает одного пациента.
-        
-        Аргументы:
-            patient_id: номер пациента (1-79)
-            patient_data: DataFrame с эпохами для этого пациента из сплита
-        
-        Возвращает:
-            Словарь с данными пациента (X, y_prob, y_hard, weights, metadata)
-        """
+    all_X, all_targets, all_weights = [], [], []
+    processed_ids = []
 
-        edf_file = Path(Config.EDF_PATH) / f"eeg{patient_id}.edf"
-        if not edf_file.exists():
-            print(f"  ⚠️ Файл не найден: {edf_file}")
-            return None
+    for patient_id in tqdm(patients, desc=f"Processing {split_name}"):
+        # Находим колонку пациента
+        col_idx = None
+        for i, val in enumerate(A.iloc[0].values):
+            if val == patient_id:
+                col_idx = i
+                break
         
-        # ========== 1. ЗАГРУЗКА EDF ==========
-        raw = mne.io.read_raw_edf(edf_file, preload=True, verbose=False)
-        orig_sr = int(raw.info['sfreq'])
-        ch_names = [ch.upper() for ch in raw.ch_names]
+        if col_idx is None:
+            log(f"⚠️ Пациент {patient_id} не найден в CSV")
+            continue
         
-        # ========== 2. ИЗВЛЕЧЕНИЕ КАНАЛОВ ==========
-        signals = []
+        # Извлекаем данные
+        a_data = A.iloc[1:, col_idx].values
+        b_data = B.iloc[1:, col_idx].values
+        c_data = C.iloc[1:, col_idx].values
         
-        for ch_idx, target_ch in enumerate(Config.CHANNELS):
-            # Поиск канала в EDF (по подстроке)
-            idx = None
-            for i, name in enumerate(ch_names):
-                if target_ch.upper() in name:
-                    idx = i
-                    break
-            
-            if idx is None:
-                print(f"  ⚠️ Канал {target_ch} не найден для пациента {patient_id}")
-                return None
-            
-            # Извлечение и обработка сигнала
-            data, _ = raw[idx, :]
-            sig = data[0].astype(np.float64)
-            sig = process_signal(sig, orig_sr, Config.TARGET_SR, self.filters)
-            signals.append(sig)
+        # Обрезаем по NaN
+        valid_len = 0
+        for i in range(len(a_data)):
+            if pd.isna(a_data[i]) or pd.isna(b_data[i]) or pd.isna(c_data[i]):
+                break
+            valid_len += 1
         
-        signals = np.stack(signals, axis=0)  # [channels, time]
+        if valid_len == 0:
+            log(f"⚠️ Пациент {patient_id} не имеет валидных аннотаций")
+            continue
         
-        # ========== 3. ПОСТРОЕНИЕ ЭКСПЕРТНЫХ РЯДОВ ==========
-        n_samples = signals.shape[1]
-        expert_A = np.zeros(n_samples)
-        expert_B = np.zeros(n_samples)
-        expert_C = np.zeros(n_samples)
+        patient_df = pd.DataFrame({
+            'expert_A': a_data[:valid_len].astype(int),
+            'expert_B': b_data[:valid_len].astype(int),
+            'expert_C': c_data[:valid_len].astype(int)
+        })
         
-        samples_per_epoch = Config.TARGET_SR * Config.EPOCH_SEC  # 512 точек
+        result = process_patient(patient_id, patient_df, filters)
+        if result:
+            all_X.append(result['X'])
+            all_targets.append(result['targets'])
+            all_weights.append(result['weights'])
+            processed_ids.append(patient_id)
+            log(f"✅ Пациент {patient_id}: {len(result['X'])} окон")
+        else:
+            log(f"⚠️ Пациент {patient_id} пропущен (ошибка чтения EDF)")
         
-        for _, row in patient_data.iterrows():
-            epoch = row['record']
-            start = (epoch - 1) * samples_per_epoch
-            end = start + samples_per_epoch
-            
-            if end > n_samples:
-                continue
-            
-            expert_A[start:end] = row['expert_A']
-            expert_B[start:end] = row['expert_B']
-            expert_C[start:end] = row['expert_C']
-        
-        # ========== 4. НАРЕЗКА ОКОН ==========
-        window_size = Config.WINDOW_SIZE
-        stride = Config.STRIDE
-        
-        windows = []
-        y_prob_list = []
-        y_hard_list = []
-        weights_list = []
-        metadata_list = []
-        
-        for start in range(0, n_samples - window_size, stride):
-            end = start + window_size
-            
-            A_win = expert_A[start:end]
-            B_win = expert_B[start:end]
-            C_win = expert_C[start:end]
-            
-            # Пропускаем окна с NaN (нет данных от экспертов)
-            if np.any(np.isnan(A_win)) or np.any(np.isnan(B_win)) or np.any(np.isnan(C_win)):
-                continue
-            
-            # Soft label (вероятность приступа)
-            y_prob = (np.mean(A_win) + np.mean(B_win) + np.mean(C_win)) / 3
-            y_prob_list.append(y_prob)
-            
-            # Hard label (бинарная метка)
-            y_hard_list.append(1 if y_prob >= 0.5 else 0)
-            
-            # Confidence (уверенность экспертов)
-            confidence = compute_confidence(A_win, B_win, C_win)
-            
-            # Pattern для середины окна
-            mid = start + window_size // 2
-            pattern_at_mid = f"{int(expert_A[mid])}{int(expert_B[mid])}{int(expert_C[mid])}"
-            pattern_weight = Config.PATTERN_WEIGHTS.get(pattern_at_mid, 0.5)
-            
-            # Расчет веса
-            sample_weight, agreement, confidence = compute_sample_weight(
-                A_win, B_win, C_win, pattern_weight
-            )
-            weights_list.append(sample_weight)
-            
-            # Сохраняем метаданные
-            metadata_list.append({
-                'patient': int(patient_id),
-                'window_start': int(start),
-                'window_end': int(end),
-                'pattern': pattern_at_mid,
-                'agreement': float(agreement),
-                'confidence': float(confidence),
-                'y_prob': float(y_prob),
-                'y_hard': 1 if y_prob >= 0.5 else 0,
-                'pattern_weight': float(pattern_weight)
-            })
-            
-            # Окно сигнала
-            windows.append(signals[:, start:end])
-        
-        if not windows:
-            return None
-        
-        return {
-            'X': np.stack(windows, axis=0).astype(np.float32),
-            'y_prob': np.array(y_prob_list).astype(np.float32),
-            'y_hard': np.array(y_hard_list).astype(np.int64),
-            'weights': np.array(weights_list).astype(np.float32),
-            'metadata': metadata_list  
-        }
+        # Принудительный сбор мусора
+        gc.collect()
     
-    def process_split(self, sample_name):
-        """
-        Обрабатывает выборку (train/val/test).
-        """
-        # Загружаем данные сплита
-        split_df = self.load_split(sample_name)
-        
-        all_X = []
-        all_y_prob = []
-        all_y_hard = []
-        all_weights = []
-        all_metadata = []
-        
-        patients = split_df['signal'].unique()
-        
-        for patient_id in tqdm(patients, desc=f"Processing {sample_name}"):
-            patient_data = split_df[split_df['signal'] == patient_id].sort_values('record')
-            result = self.process_patient(patient_id, patient_data)
-            
-            if result:
-                all_X.append(result['X'])
-                all_y_prob.append(result['y_prob'])
-                all_y_hard.append(result['y_hard'])
-                all_weights.append(result['weights'])
-                all_metadata.extend(result['metadata'])
-        
-        if not all_X:
-            print(f"❌ Нет данных для {sample_name}")
-            return
-        
-        # Объединяем все окна
-        X = np.concatenate(all_X, axis=0)
-        y_prob = np.concatenate(all_y_prob, axis=0)
-        y_hard = np.concatenate(all_y_hard, axis=0)
-        weights = np.concatenate(all_weights, axis=0)
-        
-        # Сохраняем
-        output_file = Path(Config.OUTPUT_PATH) / f"helsinki_{sample_name}.pkl"
-        with open(output_file, 'wb') as f:
-            pickle.dump({
-                'X': X,
-                'y_prob': y_prob,
-                'y_hard': y_hard,
-                'sample_weights': weights,
-                'metadata': all_metadata,
-                'config': {
-                    'n_channels': Config.N_CHANNELS,
-                    'window_size': Config.WINDOW_SIZE,
-                    'target_sr': Config.TARGET_SR,
-                    'window_sec': Config.WINDOW_SEC,
-                    'seed': Config.SEED
-                }
-            }, f, protocol=pickle.HIGHEST_PROTOCOL)
-        
-        print(f"\n✅ {sample_name}: {len(X)} окон, баланс 0/1: {np.bincount(y_hard)}")
-        print(f"   Метаданных сохранено: {len(all_metadata)}")
+    if not all_X:
+        log(f"❌ Нет данных для {split_name}")
+        return
     
-    def run(self):
-        """Запуск обработки всех трех выборок."""
-        for split_name in ['train', 'val', 'test']:
-            self.process_split(split_name)
-
+    # Объединение
+    X = np.concatenate(all_X, axis=0)
+    targets = np.concatenate(all_targets, axis=0)
+    weights = np.concatenate(all_weights, axis=0)
+    
+    # Сохранение
+    output_file = Path(Config.OUTPUT_PATH) / f"helsinki_{split_name}.pkl"
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+    
+    with open(output_file, 'wb') as f:
+        pickle.dump({
+            'X': X,
+            'targets': targets,
+            'weights': weights,
+            'metadata': {
+                'split': split_name,
+                'patients': processed_ids,
+                'n_windows': len(X),
+                'window_sec': Config.WINDOW_SEC,
+                'stride_sec': Config.STRIDE_SEC,
+                'target_sr': Config.TARGET_SR,
+                'channels': Config.CHANNELS,
+                'created': datetime.now().isoformat()
+            }
+        }, f, protocol=pickle.HIGHEST_PROTOCOL)
+    
+    log(f"\n✅ {split_name}: {len(X)} окон от {len(processed_ids)}/{len(patients)} пациентов")
+    log(f"   target mean: {targets.mean():.3f}, std: {targets.std():.3f}")
+    log(f"   weight mean: {weights.mean():.3f}, std: {weights.std():.3f}")
+    
+    if len(processed_ids) < len(patients):
+        missing = set(patients) - set(processed_ids)
+        log(f"   ⚠️ Пропущены: {sorted(missing)}")
 
 # ============================================================================
-# 3. ТОЧКА ВХОДА
+# ЗАПУСК
 # ============================================================================
 
 if __name__ == "__main__":
-    preprocessor = EEGPreprocessor()
-    preprocessor.run()
+    Config.set_seed()
     
-    print("\n" + "="*60)
-    print("ПРЕПРОЦЕССИНГ ЗАВЕРШЕН УСПЕШНО!")
-    print("="*60)
+    log("="*60)
+    log("ПРЕПРОЦЕССИНГ")
+    log("="*60)
+    log(f"SEED: {Config.SEED}")
+    log(f"Окна: {Config.WINDOW_SEC} сек, шаг {Config.STRIDE_SEC} сек")
+    log(f"Веса позиций: {Config.POS_WEIGHTS}")
+    log(f"Частота: {Config.TARGET_SR} Гц")
+    log(f"Фильтры: {Config.LOWCUT}-{Config.HIGHCUT} Гц, режектор {Config.NOTCH} Гц")
+    log("="*60)
+    
+    # Обработка выборок
+    process_split(Config.TRAIN_PATIENTS, 'train')
+    process_split(Config.VAL_PATIENTS, 'val')
+    process_split(Config.TEST_PATIENTS, 'test')
+    
+    log("\n✅ ПРЕПРОЦЕССИНГ ЗАВЕРШЁН!")
+    log_file.close()
+    
+    print(f"\nЛог сохранён: {log_filename}")
