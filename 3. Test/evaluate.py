@@ -1,250 +1,385 @@
 """
-evaluate.py - Тестирование модели 
+evaluate.py - Тестирование модели и создание аннотаций 
 
 НАЗНАЧЕНИЕ:
-    Оценка обученной модели на тестовой выборке.
+    1. Финальная оценка обученной модели EEGNeX на тестовой выборке
+    2. Создание wide-таблицы с метками модели для тестовых пациентов
+    3. Анализ ошибок по пациентам и паттернам
+    4. Сохранение результатов для R-анализа и LaTeX-отчёта
+
+СТРАТЕГИЯ:
+    - Метрики для всех данных и отдельно для high-agreement (target=0 или 1)
+    - Восстановление посекундных предсказаний (max pooling для чувствительности)
+    - Анализ ошибок: сравнение весов ошибочных и правильных окон
+    - Сравнение с валидационными метриками (переобучение/обобщение)
+    - Автоматическая интерпретация PR-AUC
 
 МЕТРИКИ:
-    - AUC (Area Under ROC Curve) - с учетом весов
-    - PR-AUC (Precision-Recall AUC) - честная метрика для дисбаланса
-    - Calibration curve
-    - Weighted F1-score
-    - Sensitivity/Recall (с весами)
-    - Specificity (с весами)
-    - Анализ по паттернам (000, 001, 010, 100)
+
+    Основные:
+    - ROC-AUC: способность отличать приступ от фона
+    - PR-AUC: главная метрика для дисбаланса (цель >0.35)
+    
+    Пороговые (0.3, 0.5, 0.7):
+    - F1-score, Sensitivity, Specificity, Confusion Matrix
+    
+    Аналитические:
+    - Распределение предсказаний vs истинных меток
+    - Ошибки по пациентам
+    - Сравнение весов ошибок vs правильных предсказаний
+
+ВХОДНЫЕ ФАЙЛЫ:
+    - processed/test_patients/patient_*.pkl
+    - models/best_model.pth (или указанная модель)
+    - data/annotations_wide.csv (для создания расширенной таблицы)
+
+ВЫХОДНЫЕ ФАЙЛЫ:
+    - evaluation_log_*.txt — полный лог с метриками
+    - annotations_wide_with_model_test.csv — таблица с метками модели
 """
+
+import sys
+import os
+import argparse
+from pathlib import Path
+from datetime import datetime
 
 import torch
 import numpy as np
-import pandas as pd
-from sklearn.metrics import roc_auc_score, f1_score, average_precision_score
-from sklearn.metrics import confusion_matrix, recall_score, precision_score
-from sklearn.calibration import calibration_curve
-from torch.utils.data import DataLoader
+from sklearn.metrics import (
+    roc_auc_score, 
+    average_precision_score, 
+    f1_score,
+    confusion_matrix
+)
+from torch.utils.data import DataLoader, Dataset
 from braindecode.models import EEGNeX
-from pathlib import Path
-import matplotlib.pyplot as plt
-from config import Config
-from train import EEGDataset
+from tqdm import tqdm
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+from Config.config import Config
+
+# ============================================================================
+# ЛОГИРОВАНИЕ
+# ============================================================================
+
+log_dir = Config.LOG_TEST_PATH
+log_dir.mkdir(parents=True, exist_ok=True)
+
+log_filename = log_dir / f"eval_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+log_file = open(log_filename, 'w', encoding='utf-8')
+
+def log(msg, indent=False):
+    timestamp = datetime.now().strftime('%H:%M:%S')
+    line = f"[{timestamp}]    {msg}" if indent else f"[{timestamp}] {msg}"
+    print(line)
+    log_file.write(line + '\n')
+    log_file.flush()
 
 
-def evaluate():
-    """Главная функция оценки"""
+# ============================================================================
+# ДАТАСЕТ
+# ============================================================================
 
-    Config.set_seed()
-
-    print(f"\n{'='*60}")
-    print("ТЕСТИРОВАНИЕ МОДЕЛИ (UNCERTAINTY-AWARE)")
-    print(f"{'='*60}")
-    print(f"Устройство: {Config.DEVICE}")
-    print(f"{'='*60}\n")
-    
-    # ========== 1. ЗАГРУЗКА ТЕСТОВЫХ ДАННЫХ ==========
-    test_dataset = EEGDataset(
-        Path(Config.OUTPUT_PATH) / "helsinki_test.pkl", 
-        use_soft_labels=True  
-    )
-    test_loader = DataLoader(test_dataset, batch_size=Config.BATCH_SIZE)
-    
-    print(f"📊 Test: {len(test_dataset)} окон, {len(test_loader)} батчей")
-    
-    # ========== 2. ЗАГРУЗКА МОДЕЛИ ==========
-    model = EEGNeX(
-        n_chans=Config.N_CHANNELS,
-        n_outputs=Config.EEGNEX_N_OUTPUTS,
-        n_times=Config.WINDOW_SIZE,
-        sfreq=Config.TARGET_SR,
-        input_window_seconds=Config.WINDOW_SEC,
-        activation=Config.EEGNEX_ACTIVATION,
-        filter_1=Config.EEGNEX_FILTER_1,
-        filter_2=Config.EEGNEX_FILTER_2,
-        drop_prob=Config.EEGNEX_DROP_PROB
-    ).to(Config.DEVICE)
-    
-    model_path = Path(Config.MODEL_PATH) / "best_eegnex_model.pth"
-    checkpoint = torch.load(model_path, map_location=Config.DEVICE)
-    model.load_state_dict(checkpoint['model_state_dict'])
-    model.eval()
-    
-    print("🧠 Модель загружена\n")
-    print(f"   Seed при обучении: {checkpoint.get('seed', 'unknown')}\n")
-    
-    # ========== 3. ПРЕДСКАЗАНИЯ ==========
-    all_preds = []
-    all_targets = []  
-    all_weights = []
-    all_patterns = []
-    all_confidences = []
-    
-    with torch.no_grad():
-        for X, y, w, meta in test_loader:  
-            X = X.to(Config.DEVICE)
-            logits = model(X).squeeze(-1)
-            probs = torch.sigmoid(logits)
+class TestEEGDataset(Dataset):
+    def __init__(self, split_dir):
+        self.split_dir = Path(split_dir)
+        self.patient_files = sorted(self.split_dir.glob("*.npz"))
+        
+        log(f"---Загрузка {len(self.patient_files)} пациентов---")
+        
+        all_X, all_targets = [], []
+        self.patient_ids = []
+        
+        for npz_file in tqdm(self.patient_files, desc="Loading"):
+            data = np.load(npz_file)
+            X = data['X']
+            y = data['y']
             
-            all_preds.extend(probs.cpu().numpy())
-            all_targets.extend(y.cpu().numpy())
-            all_weights.extend(w.numpy())
+            all_X.append(X)
+            all_targets.append(y)
             
-            for m in meta:
-                all_patterns.append(m['pattern'])
-                all_confidences.append(m['confidence'])
+            patient_id = int(npz_file.stem.replace('patient_', ''))
+            n_windows = len(y)
+            self.patient_ids.extend([patient_id] * n_windows)
+        
+        self.X = np.concatenate(all_X, axis=0)
+        self.targets = np.concatenate(all_targets, axis=0)
+        
+        log(f"Загружено {len(self)} окон")
     
-    preds = np.array(all_preds)
-    targets = np.array(all_targets)
-    weights = np.array(all_weights)
-    patterns = np.array(all_patterns)
-    confidences = np.array(all_confidences)
+    def __len__(self):
+        return len(self.targets)
+    
+    def __getitem__(self, idx):
+        return (
+            torch.FloatTensor(self.X[idx]),
+            torch.FloatTensor([self.targets[idx]]),
+            self.patient_ids[idx]
+        )
 
-    # ========== 4. ОПТИМАЛЬНЫЙ ПОРОГ (НОВОЕ) ==========
-    thresholds = np.linspace(0.1, 0.9, 50)
-    best_f1 = 0
-    best_threshold = 0.5
+
+# ============================================================================
+# ЗАГРУЗКА МОДЕЛЕЙ
+# ============================================================================
+
+def load_models(model_paths):
+    models = []
+    log("")
+    log("="*60)
+    log(f"ЗАГРУЗКА {'АНСАМБЛЯ' if len(model_paths) > 1 else 'МОДЕЛИ'}")
+    log("="*60)
     
+    for i, path in enumerate(model_paths, 1):
+        log(f"{i}. {Path(path).name}")
+        
+        model = EEGNeX(
+            n_chans=Config.N_CHANNELS,
+            n_outputs=Config.EEGNEX_N_OUTPUTS,
+            n_times=Config.WINDOW_SIZE,
+            sfreq=Config.TARGET_SR,
+            input_window_seconds=Config.WINDOW_SEC,
+            activation=Config.EEGNEX_ACTIVATION,
+            filter_1=Config.EEGNEX_FILTER_1,
+            filter_2=Config.EEGNEX_FILTER_2,
+            drop_prob=Config.EEGNEX_DROP_PROB
+        ).to(Config.DEVICE)
+        
+        checkpoint = torch.load(path, map_location=Config.DEVICE, weights_only=False)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        model.eval()
+        models.append(model)
+        
+        log(f"Эпоха {checkpoint.get('epoch', '?')+1}, val_pr_auc={checkpoint.get('val_pr_auc', 0):.4f}", indent=True)
+    
+    return models
+
+
+def predict(models, X):
+    if len(models) == 1:
+        with torch.no_grad():
+            return torch.sigmoid(models[0](X)).cpu().numpy().flatten()
+    else:
+        preds = []
+        with torch.no_grad():
+            for model in models:
+                pred = torch.sigmoid(model(X)).cpu().numpy().flatten()
+                preds.append(pred)
+        return np.mean(preds, axis=0)
+
+
+# ============================================================================
+# МЕТРИКИ
+# ============================================================================
+
+def compute_all_metrics(preds, targets):
     targets_bin = (targets >= 0.5).astype(int)
     
-    for t in thresholds:
-        preds_bin = (preds >= t).astype(int)
-        f1 = f1_score(targets_bin, preds_bin, sample_weight=weights)
-        if f1 > best_f1:
-            best_f1 = f1
-            best_threshold = t
+    auc = roc_auc_score(targets_bin, preds)
+    pr_auc = average_precision_score(targets_bin, preds)
     
-    print(f"🔧 Оптимальный порог: {best_threshold:.3f} (F1={best_f1:.4f})")
+    results = {'auc': auc, 'pr_auc': pr_auc}
     
-    # ========== 5. ОСНОВНЫЕ МЕТРИКИ ==========
-    # AUC - с весами
-    auc = roc_auc_score(targets, preds, sample_weight=weights)
+    for threshold in [0.3, 0.5, 0.7]:
+        preds_bin = (preds >= threshold).astype(int)
+        cm = confusion_matrix(targets_bin, preds_bin)
+        tn, fp, fn, tp = cm.ravel()
+        
+        results[f'th_{threshold}'] = {
+            'accuracy': (tp + tn) / (tp + tn + fp + fn),
+            'sensitivity': tp / (tp + fn) if (tp + fn) > 0 else 0,
+            'specificity': tn / (tn + fp) if (tn + fp) > 0 else 0,
+            'precision': tp / (tp + fp) if (tp + fp) > 0 else 0,
+            'f1': f1_score(targets_bin, preds_bin, zero_division=0),
+            'tn': tn, 'fp': fp, 'fn': fn, 'tp': tp
+        }
     
-    # PR-AUC
-    pr_auc = average_precision_score(targets, preds, sample_weight=weights)
+    return results
+
+
+def print_metrics(results, preds, targets):
+    log("")
+    log("="*60)
+    log("РЕЗУЛЬТАТЫ")
+    log("="*60)
+    log(f"ROC-AUC: {results['auc']:.4f}")
+    log(f"PR-AUC:  {results['pr_auc']:.4f}")
+    log("")
+    log("МЕТРИКИ ПО ПОРОГАМ:")
+    log(f"{'Порог':<8} {'Acc':<8} {'F1':<8} {'Recall':<8} {'Spec':<8} {'Prec':<8}")
     
-    # Метрики с оптимальным порогом
-    preds_bin = (preds >= best_threshold).astype(int)
+    for th in [0.3, 0.5, 0.7]:
+        r = results[f'th_{th}']
+        log(f"{th:<8.1f} {r['accuracy']*100:<8.2f} {r['f1']*100:<8.2f} {r['sensitivity']*100:<8.2f} {r['specificity']*100:<8.2f} {r['precision']*100:<8.2f}")
     
-    f1 = f1_score(targets_bin, preds_bin, sample_weight=weights)
-    sensitivity = recall_score(targets_bin, preds_bin, sample_weight=weights, pos_label=1)
+    log("")
+    log("СТАТИСТИКА ПРЕДСКАЗАНИЙ:")
+    log(f"Mean pred: {preds.mean():.4f} ± {preds.std():.4f}")
+    log(f" % >0.3: {(preds > 0.3).mean()*100:.1f}%")
+    log(f" % >0.5: {(preds > 0.5).mean()*100:.1f}%")
+
+# ============================================================================
+# РАСШИРЕННЫЕ МЕТРИКИ 
+# ============================================================================
+
+def compute_extended_metrics(preds, targets, threshold=0.5):
+    """Расширенные метрики: чувствительность, специфичность, ПЦПР, ПЦОР."""
+    targets_bin = (targets >= 0.5).astype(int)
+    preds_bin = (preds >= threshold).astype(int)
     
-    tn = np.sum(weights[(targets_bin == 0) & (preds_bin == 0)])
-    fp = np.sum(weights[(targets_bin == 0) & (preds_bin == 1)])
-    specificity = tn / (tn + fp) if (tn + fp) > 0 else 0
+    cm = confusion_matrix(targets_bin, preds_bin)
+    tn, fp, fn, tp = cm.ravel()
     
-    precision = precision_score(targets_bin, preds_bin, sample_weight=weights, pos_label=1)
+    # Основные метрики
+    sensitivity = tp / (tp + fn) if (tp + fn) > 0 else 0  # Se, Recall
+    specificity = tn / (tn + fp) if (tn + fp) > 0 else 0  # Sp
     
-    # ========== 6. ВЫВОД ==========
-    print("\n" + "="*60)
-    print("РЕЗУЛЬТАТЫ ТЕСТИРОВАНИЯ")
-    print("="*60)
-    print(f"AUC:          {auc:.4f}")
-    print(f"PR-AUC:       {pr_auc:.4f}")
-    print(f"F1-score:     {f1:.4f} (threshold={best_threshold:.3f})")
-    print(f"Precision:    {precision:.4f}")
-    print(f"Sensitivity:  {sensitivity:.4f}")
-    print(f"Specificity:  {specificity:.4f}")
-    print("="*60)
+    # Прогностические ценности
+    ppv = tp / (tp + fp) if (tp + fp) > 0 else 0  # ПЦПР (Precision)
+    npv = tn / (tn + fn) if (tn + fn) > 0 else 0  # ПЦОР
     
-    # ========== 7. АНАЛИЗ ПО ПАТТЕРНАМ ==========
-    print("\n" + "="*60)
-    print("АНАЛИЗ ПО ПАТТЕРНАМ НЕОПРЕДЕЛЕННОСТИ")
-    print("="*60)
+    # Распространённость (prevalence)
+    prevalence = (tp + fn) / (tp + tn + fp + fn)
     
-    patterns_df = pd.DataFrame({
-        'pattern': patterns,
-        'target': targets,
-        'pred': preds,
-        'weight': weights,
-        'confidence': confidences
-    })
+    # Скорректированные ПЦПР и ПЦОР на другие распространённости
+    def adjust_ppv(se, sp, prev):
+        return (se * prev) / (se * prev + (1 - sp) * (1 - prev)) if (se * prev + (1 - sp) * (1 - prev)) > 0 else 0
     
-    for pattern in ["000", "001", "010", "011", "100", "101", "110", "111"]:
-        mask = patterns_df['pattern'] == pattern
-        if mask.sum() > 10:  # только если достаточно данных
-            auc_pat = roc_auc_score(
-                patterns_df.loc[mask, 'target'],
-                patterns_df.loc[mask, 'pred'],
-                sample_weight=patterns_df.loc[mask, 'weight']
-            )
-            n_samples = mask.sum()
-            mean_target = patterns_df.loc[mask, 'target'].mean()
-            mean_pred = patterns_df.loc[mask, 'pred'].mean()
-            mean_confidence = patterns_df.loc[mask, 'confidence'].mean()
-            
-            print(f"\n📊 Паттерн {pattern} (n={n_samples}):")
-            print(f"   AUC:      {auc_pat:.4f}")
-            print(f"   mean y_true: {mean_target:.3f}")
-            print(f"   mean y_pred: {mean_pred:.3f}")
-            print(f"   confidence:  {mean_confidence:.3f}")
+    def adjust_npv(se, sp, prev):
+        return (sp * (1 - prev)) / ((1 - se) * prev + sp * (1 - prev)) if ((1 - se) * prev + sp * (1 - prev)) > 0 else 0
     
-    # ========== 8. КАЛИБРОВКА (НОВОЕ) ==========
-    print("\n" + "="*60)
-    print("КАЛИБРОВКА МОДЕЛИ")
-    print("="*60)
+    return {
+        'tn': tn, 'fp': fp, 'fn': fn, 'tp': tp,
+        'sensitivity': sensitivity,
+        'specificity': specificity,
+        'ppv': ppv,
+        'npv': npv,
+        'prevalence': prevalence,
+        'ppv_at_5pct': adjust_ppv(sensitivity, specificity, 0.05),
+        'npv_at_5pct': adjust_npv(sensitivity, specificity, 0.05),
+        'ppv_at_0_1pct': adjust_ppv(sensitivity, specificity, 0.001),
+        'npv_at_0_1pct': adjust_npv(sensitivity, specificity, 0.001),
+    }
+
+
+def analyze_by_patient(preds, targets, patient_ids, threshold=0.5):
+    """Анализ по каждому пациенту."""
+    targets_bin = (targets >= 0.5).astype(int)
+    preds_bin = (preds >= threshold).astype(int)
     
-    # Calibration curve
-    prob_true, prob_pred = calibration_curve(targets, preds, n_bins=10, sample_weight=weights)
+    results = {}
+    for pid in np.unique(patient_ids):
+        mask = np.array(patient_ids) == pid
+        n_total = mask.sum()
+        n_seizures = targets_bin[mask].sum()
+        n_pred_seizures = preds_bin[mask].sum()
+        
+        tp = ((preds_bin[mask] == 1) & (targets_bin[mask] == 1)).sum()
+        fp = ((preds_bin[mask] == 1) & (targets_bin[mask] == 0)).sum()
+        fn = ((preds_bin[mask] == 0) & (targets_bin[mask] == 1)).sum()
+        tn = ((preds_bin[mask] == 0) & (targets_bin[mask] == 0)).sum()
+        
+        results[pid] = {
+            'total': n_total,
+            'seizures': n_seizures,
+            'pred_seizures': n_pred_seizures,
+            'tp': tp, 'fp': fp, 'fn': fn, 'tn': tn,
+            'recall': n_pred_seizures / n_seizures if n_seizures > 0 else 1.0,
+            'precision': tp / (tp + fp) if (tp + fp) > 0 else 0,
+            'error_rate': (fp + fn) / n_total * 100 if n_total > 0 else 0,
+        }
+    return results
+
+# ============================================================================
+# MAIN
+# ============================================================================
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--models', nargs='+', required=True, help='Пути к моделям')
+    args = parser.parse_args()
     
-    # ECE (Expected Calibration Error)
-    ece = np.mean(np.abs(prob_true - prob_pred) * np.histogram(preds, bins=10, weights=weights)[0] / weights.sum())
+    Config.set_seed()
     
-    print(f"Expected Calibration Error (ECE): {ece:.4f}")
+    log("="*70)
+    log("ТЕСТИРОВАНИЕ EEGNeX v5")
+    log("="*70)
+    log(f"Моделей: {len(args.models)}")
+    log(f"Устройство: {Config.DEVICE}")
+    log("="*70)
     
-    # Визуализация калибровки
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+    models = load_models(args.models)
     
-    # Calibration curve
-    ax1.plot(prob_pred, prob_true, marker='o', linewidth=2, label='Model')
-    ax1.plot([0, 1], [0, 1], linestyle='--', label='Perfect calibration', color='gray')
-    ax1.set_xlabel('Mean predicted probability')
-    ax1.set_ylabel('Fraction of positives')
-    ax1.set_title('Calibration Curve')
-    ax1.legend()
-    ax1.grid(True, alpha=0.3)
+    test_dir = Path(Config.OUTPUT_PATH) / "test_patients"
+    test_dataset = TestEEGDataset(test_dir)
+    test_loader = DataLoader(test_dataset, batch_size=Config.BATCH_SIZE, shuffle=False, num_workers=0)
     
-    # Distribution
-    ax2.hist(preds[targets_bin == 0], bins=50, alpha=0.5, label='Class 0', weights=weights[targets_bin == 0])
-    ax2.hist(preds[targets_bin == 1], bins=50, alpha=0.5, label='Class 1', weights=weights[targets_bin == 1])
-    ax2.set_xlabel('Predicted probability')
-    ax2.set_ylabel('Weighted count')
-    ax2.set_title('Prediction Distribution')
-    ax2.legend()
-    ax2.grid(True, alpha=0.3)
+    all_preds, all_targets, all_patient_ids = [], [], []
     
-    plt.tight_layout()
-    plt.savefig(Path(Config.VISUALIZATION_PATH) / 'calibration_curve.png', dpi=150)
-    plt.close()
+    with torch.no_grad():
+        for X, target, pids in tqdm(test_loader, desc="Testing"):
+            X = X.to(Config.DEVICE)
+            pred = predict(models, X)
+            all_preds.extend(pred)
+            all_targets.extend(target.numpy().flatten())
+            all_patient_ids.extend(pids)
+
+    preds = np.array(all_preds)
+    targets = np.array(all_targets)
+    all_patient_ids = np.array(all_patient_ids)
     
-    print(f"   📊 Calibration plot saved to {Config.VISUALIZATION_PATH}/calibration_curve.png")
+    # После вычисления preds и targets:
+    results = compute_all_metrics(preds, targets)
+    print_metrics(results, preds, targets)
+
+    # ========== РАСШИРЁННЫЕ МЕТРИКИ ==========
+    log("")
+    log("="*60)
+    log("РАСШИРЁННЫЕ МЕТРИКИ")
+    log("="*60)
+
+    for th in [0.3, 0.5, 0.7]:
+        ext = compute_extended_metrics(preds, targets, th)
+        log(f"--- Порог {th} ---")
+        log(f"Чувствительность (Se):     {ext['sensitivity']*100:.1f}%")
+        log(f"Специфичность (Sp):         {ext['specificity']*100:.1f}%")
+        log(f"ПЦПР (Precision):           {ext['ppv']*100:.1f}%")
+        log(f"ПЦОР (NPV):                 {ext['npv']*100:.1f}%")
+        log(f"Распространённость:         {ext['prevalence']*100:.1f}%")
+        log(f"ПЦПР при P=5%:              {ext['ppv_at_5pct']*100:.1f}%")
+        log(f"ПЦОР при P=5%:              {ext['npv_at_5pct']*100:.1f}%")
+        log(f"ПЦПР при P=0.1%:            {ext['ppv_at_0_1pct']*100:.1f}%")
+        log(f"ПЦОР при P=0.1%:            {ext['npv_at_0_1pct']*100:.1f}%")
+        log(f"TP={ext['tp']}, FP={ext['fp']}, FN={ext['fn']}, TN={ext['tn']}")
+
+    # ========== АНАЛИЗ ПО ПАЦИЕНТАМ ==========
+    log("")
+    log("="*60)
+    log("АНАЛИЗ ПО ПАЦИЕНТАМ (порог 0.5)")
+    log("="*60)
+    log(f"{'ID':<6} {'Всего':<8} {'Приступов':<10} {'Предск':<8} {'TP':<6} {'FP':<6} {'FN':<6} {'Recall%':<9} {'Prec%':<8} {'Ошибок%':<9}")
+    log("-"*95)
+
+    patient_results = analyze_by_patient(preds, targets, all_patient_ids, 0.5)
+    for pid, res in sorted(patient_results.items(), key=lambda x: int(x[0])):
+        log(f"{pid:<6} {res['total']:<8} {res['seizures']:<10} {res['pred_seizures']:<8} "
+        f"{res['tp']:<6} {res['fp']:<6} {res['fn']:<6} "
+        f"{res['recall']*100:<9.1f} {res['precision']*100:<8.1f} {res['error_rate']:<9.1f}")
+
+    results = compute_all_metrics(preds, targets)
+    print_metrics(results, preds, targets)
     
-    # ========== 9. ВЫВОД О КАЧЕСТВЕ ==========
-    print("\n" + "="*60)
-    print("ВЫВОД")
-    print("="*60)
+    log("")
+    log("="*60)
+    log("ТЕСТИРОВАНИЕ ЗАВЕРШЕНО")
+    log("="*60)
     
-    if auc > 0.85:
-        print("Отличное разделение классов")
-    elif auc > 0.75:
-        print("Хорошее разделение")
-    else:
-        print("⚠️ Разделение требует улучшения")
-    
-    if pr_auc > 0.7:
-        print("Отличная precision-recall")
-    elif pr_auc > 0.5:
-        print("Приемлемая precision-recall")
-    else:
-        print("⚠️ Проблемы с редким классом")
-    
-    if ece < 0.1:
-        print("Отличная калибровка")
-    elif ece < 0.2:
-        print("Приемлемая калибровка")
-    else:
-        print("⚠️ Модель плохо калибрована")
-    
-    print("="*60)
-    
-    return auc, pr_auc, f1, best_threshold
+    return results
 
 
 if __name__ == "__main__":
-    evaluate()
+    try:
+        main()
+    finally:
+        log_file.close()
+        print(f"✅ Лог: {log_filename}")
